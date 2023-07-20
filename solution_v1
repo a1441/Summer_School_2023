@@ -1,63 +1,270 @@
+import numpy as np
+import pandas as pd
+from keras.models import Sequential
+from keras.layers import LSTM, Dense
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.decomposition import PCA
+from scipy.fft import fft, ifft
+import math
+
+import numpy as np
+import pandas as pd
+from scipy.fft import fft, ifft
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.utils.validation import check_is_fitted
+from sklearn.metrics import r2_score
+
+def transform_data(csv_file):
+    
+    """This function takes the raw data, applies cleaning rules, splits activities based on 30 sec delays and then 
+    partitions it by 1500 rows where 900 are the train set, 300 are the validaton set and the rest of 300 are the 
+    cross validation set."""
+    
+    class DataProcessor:
+        def clean_dataframe(self, data):
+            # Convert selected columns to float
+            float_columns = ['Activity', 'PeakAcceleration', 'ECGAmplitude', 'ECGNoise', 'CoreTemp',
+                             'AvStepPeriod', 'AvForceDevRate', 'AvStepImpulse']
+            data[float_columns] = data[float_columns].apply(lambda x: x.str.replace(',', '.').astype(float))
+
+            # Convert 'Time' column to pandas datetime format
+            data['Time_New'] = pd.to_datetime(data['Time'], format="%d.%m.%Y %H:%M:%S")
+
+            return data.fillna(0)
+
+        def create_full_activity_column(self, df, additional_column=None):
+            # Combine activity-related columns into a single column
+            activity_full = df['Activities'] + ':category:' + df['Activities Detailed'] + ':person:' + df['Name of the volunteer']
+
+            if additional_column:
+                # Append additional column to the activity column if provided
+                activity_full += ':timesplit:' + df[additional_column].astype(str)
+
+            return activity_full
+
+        def calculate_time_difference(self, df, activity_full, column):
+            # Calculate the time difference between consecutive rows within each activity group
+            time_diff = df.groupby(activity_full)[column].diff().apply(lambda x: x.total_seconds()).fillna(0).astype(int)
+            return time_diff
+
+        def partition_and_divide_df(self, df, column='ActivitySplit'):
+            groups = df.groupby(column)
+
+            df900_list = []
+            df300c_list = []
+            df300v_list = []
+
+            partition_index = 0  # Counter for partition index
+
+            for label, group_df in groups:
+                if len(group_df) < 1500:
+                    continue  # Skip groups smaller than 1500 rows
+
+                group_df = group_df.sort_values(by='Time_New', ascending=True)
+
+                num_partitions = math.floor(len(group_df) / 1500)
+
+                for i in range(num_partitions):
+                    # Partition the group into 900, 300c, and 300v segments
+                    partition = group_df[i * 1500:(i + 1) * 1500].copy()
+                    df900 = partition[0:900].copy()
+                    df300c = partition[900:1200].copy()
+                    df300v = partition[1200:1500].copy()
+
+                    # Modify 'ActivitySplit' to include partition_index
+                    split_label = f"{label}:split:{partition_index}"
+                    df900['ActivitySplit'] = split_label
+                    df300c['ActivitySplit'] = split_label
+                    df300v['ActivitySplit'] = split_label
+
+                    # Append to lists
+                    df900_list.append(df900)
+                    df300c_list.append(df300c)
+                    df300v_list.append(df300v)
+
+                    partition_index += 1  # Increment the partition index for the next partition
+
+            # Concatenate the partitioned DataFrames
+            df900 = pd.concat(df900_list)
+            df300c = pd.concat(df300c_list)
+            df300v = pd.concat(df300v_list)
+
+            return df900, df300c, df300v
+
+    # Load the raw data from the CSV file
+    raw = pd.read_csv(csv_file, engine='python', delimiter=';')
+
+    # Instantiate the DataProcessor class
+    processor = DataProcessor()
+
+    # Clean the DataFrame
+    raw_clean = processor.clean_dataframe(raw)
+
+    # Create 'ActivityFull' column by combining activity-related columns
+    raw_clean['ActivityFull'] = processor.create_full_activity_column(raw_clean)
+
+    # Calculate the time difference for each activity
+    raw_clean['Seconds_Difference'] = processor.calculate_time_difference(raw_clean, 'ActivityFull', 'Time_New')
+
+    # Determine if the time difference is greater than 30 seconds (to mark splits)
+    raw_clean['Split_Marker'] = ((raw_clean['Seconds_Difference'] == 0) | (raw_clean['Seconds_Difference'] > 33)).astype(int)
+
+    # Create cumulative split count for each activity
+    raw_clean['Cumulative_Split'] = raw_clean.groupby('ActivityFull')['Split_Marker'].cumsum()
+
+    # Create 'ActivitySplit' column by combining activity and cumulative split information
+    raw_clean['ActivitySplit'] = processor.create_full_activity_column(raw_clean, 'Cumulative_Split')
+
+    # Partition and divide the DataFrame into df900, df300c, and df300v segments
+    df900, df300c, df300v = processor.partition_and_divide_df(raw_clean.reset_index(drop=False))
+
+    return df900, df300c, df300v
+
+
+df900, df300c, df300v = transform_data('Zephyr Data Emo with new categories.csv')
+
+
+from sklearn.base import BaseEstimator, TransformerMixin
+from scipy.fft import fft, ifft
 import pandas as pd
 import numpy as np
-import seaborn as sns
-import matplotlib.pyplot as plt
+
+class HarmonicsExtractor(BaseEstimator, TransformerMixin):
+    def __init__(self, timestamp_col, columns, n_harmonics, freq='S', activity_column=None, additional_columns=None):
+        self.timestamp_col = timestamp_col
+        self.columns = columns
+        self.n_harmonics = n_harmonics
+        self.freq = freq
+        self.activity_column = activity_column
+        self.additional_columns = additional_columns if additional_columns else ['index','Activities Detailed']
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        if self.activity_column is None:
+            return self._process_and_extract_harmonics_time_series(X)
+        else:
+            return self._extract_harmonics_all_activities(X)
+    
+    def _ensure_sampling_consistency(self, df):
+        df[self.timestamp_col] = pd.to_datetime(df[self.timestamp_col])
+        df = df.set_index(self.timestamp_col)
+
+        agg_methods = {}
+        for col in df.columns:
+            if df[col].dtype == 'float64' or df[col].dtype == 'int64':
+                agg_methods[col] = 'mean'
+            else:
+                agg_methods[col] = 'first'
+
+        df = df.resample(self.freq).agg(agg_methods)
+
+        for col in df.columns:
+            if df[col].dtype == 'float64' or df[col].dtype == 'int64':
+                df[col] = df[col].interpolate()
+            else:
+                df[col] = df[col].fillna(method='ffill')
+        
+        return df
+
+    def _replace_outliers(self, df):
+        for column in self.columns:
+            Q1 = df[column].quantile(0.25)
+            Q3 = df[column].quantile(0.75)
+            IQR = Q3 - Q1
+            outliers = (df[column] < Q1 - 1.5 * IQR) | (df[column] > Q3 + 1.5 * IQR)
+            detected_outliers = df[outliers]
+
+            clean_data_iqr = df[~outliers].fillna(0)
+
+            mean_value = clean_data_iqr[column].mean()
+            noise = np.random.normal(0, 0.1, len(detected_outliers))
+            mean_value_with_noise = noise + mean_value
+
+            df.loc[outliers, column] = mean_value_with_noise
+
+        return df
+
+    def _preprocess_data(self, df):
+        df_preprocessed = df.copy()
+    
+        for col in self.columns:
+            df[col] = df[col].fillna(df[col].mean())
+            upper_limit = df[col].mean() + 3 * df[col].std()
+            lower_limit = df[col].mean() - 3 * df[col].std()
+            df.loc[df[col] > upper_limit, col] = upper_limit
+            df.loc[df[col] < lower_limit, col] = lower_limit
+
+            min_val = df[col].min()
+            max_val = df[col].max()
+            df_preprocessed[col] = (df[col] - min_val) / (max_val - min_val)
+
+            if df_preprocessed[col].isna().all():
+                self.columns.remove(col)
+
+        return df_preprocessed, self.columns
+
+    def _extract_harmonics(self, df):
+        df_harmonics = pd.DataFrame(index=df.index)
+    
+        if self.additional_columns:
+            for column in self.additional_columns:
+                df_harmonics[column] = df[column]
+    
+        for column in self.columns:
+            fft_values = fft(df[column].values)
+            truncated_fft_values = fft_values[:self.n_harmonics]
+
+            for i in range(self.n_harmonics):
+                single_harmonic_fft_values = np.zeros(len(fft_values), dtype=complex)
+                single_harmonic_fft_values[i] = truncated_fft_values[i]
+                single_harmonic_time_series = ifft(single_harmonic_fft_values).real
+
+                df_harmonics[f'{column}_harmonic_{i+1}'] = single_harmonic_time_series
+
+            reconstructed_fft_values = np.zeros(len(fft_values), dtype=complex)
+            reconstructed_fft_values[:self.n_harmonics] = truncated_fft_values
+            reconstructed_series = ifft(reconstructed_fft_values).real
+            df_harmonics[f'{column}_reconstructed'] = reconstructed_series
+
+            df_harmonics[f'{column}_preprocessed'] = df[column]
+
+        return df_harmonics
+
+    def _process_and_extract_harmonics_time_series(self, df):
+        df = self._ensure_sampling_consistency(df)
+        df = self._replace_outliers(df)
+        df, self.columns = self._preprocess_data(df)
+        df_harmonics = self._extract_harmonics(df)
+
+        return df_harmonics
+
+    def _extract_harmonics_all_activities(self, df):
+        all_harmonics_dfs = []
+        activity_values = df[self.activity_column].unique()
+    
+        for activity in activity_values:
+            df_activity = df[df[self.activity_column] == activity]
+        
+            df_harmonics = self._process_and_extract_harmonics_time_series(df_activity)
+        
+            if not df_harmonics.empty:
+                df_harmonics[self.activity_column] = activity
+                all_harmonics_dfs.append(df_harmonics)
+    
+        df_all_harmonics = pd.concat(all_harmonics_dfs)
+    
+        return df_all_harmonics.fillna(0)
 
 
-data=pd.read_csv('Zephyr Data Emo with new categories.csv', engine="python", delimiter=';')
-data.fillna(0, inplace=True)
+harmonics_extractor = HarmonicsExtractor(timestamp_col='Time_New', 
+                                         columns=['ImpulseLoad','HRV','HR','BR','Posture','Activity'], 
+                                         n_harmonics=20, 
+                                         activity_column='ActivitySplit')
 
-print(data['Name of the volunteer'].unique())
-
-columns = data.columns.to_list()
-print(columns)
-type(data['Activity'].iloc[0])
-
-#float(data['Activity'].iloc[0].replace(',','.'))
-
-data['Activity'] = data['Activity'].str.replace(',', '.')
-data['Activity'] = data['Activity'].astype(float)
-
-data['PeakAcceleration'] = data['PeakAcceleration'].str.replace(',', '.')
-data['PeakAcceleration'] = data['PeakAcceleration'].astype(float)
-
-data['ECGAmplitude'] = data['ECGAmplitude'].str.replace(',', '.')
-data['ECGAmplitude'] = data['ECGAmplitude'].astype(float)
-
-data['ECGNoise'] = data['ECGNoise'].str.replace(',', '.')
-data['ECGNoise'] = data['ECGNoise'].astype(float)
-
-data['CoreTemp'] = data['CoreTemp'].str.replace(',', '.')
-data['CoreTemp'] = data['CoreTemp'].astype(float)
-
-
-#grouping
-#df = data.groupby(['HR', 'HRV'])['Name of the volunteer'].unique()
-
-#histogram of HRconfidence
-bins = np.linspace(start=0, stop=100, num=11)
-data['HRConfidence'].hist(bins=bins)
-
-#data['Before Controled stress'].unique()
-numerical_columns = data.select_dtypes(include=[np.number])  # Select numerical columns
-non_binary_columns = numerical_columns.loc[:, ~(numerical_columns.isin([0, 1])).all()]  # Exclude columns with only 0s and 1s
-# Exclude these columns as they don't provide important information
-columns_to_exclude = ['Year', 'Hour']
-non_binary_columns  = data.drop(columns=columns_to_exclude)
-len(non_binary_columns.columns)
-
-correlation_matrix = non_binary_columns.corr()
-
-# Create the heatmap
-plt.figure(figsize=(10, 8))  # Adjust the figure size as needed
-sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm')
-
-# Set the plot title
-plt.title('Pairwise Correlation Heatmap')
-
-# Show the plot
-plt.show()
-
-
-
-
+harmonics_extractor.fit(df900)
+df900_transformed = harmonics_extractor.transform(df900)
